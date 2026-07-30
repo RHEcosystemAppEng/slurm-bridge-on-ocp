@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+scripts/
+data/DATA_INFO.md
+data-full/DATA_INFO.md
+data-news/DATA_INFO.md
