@@ -183,14 +183,23 @@ oc logs bridge-test -n default
 Run the PyTorch demo:
 
 ```bash
-# CPU
+# CPU (attached — tails logs and retrieves results automatically)
 ./demos/text-classifier-demo.sh --image <your-training-image>
+
+# CPU, full dataset (detached — submits and exits immediately)
+./demos/text-classifier-demo.sh --image <your-training-image> --dataset full --detach
 
 # GPU (requires NVIDIA GPU Operator on cluster)
 ./demos/text-classifier-demo.sh --image <your-training-image> --gpu 1
 ```
 
-See [`docs/DEMO.md`](DEMO.md) for image build instructions.
+**Detached mode:** results are written to a PVC (`training-results`) that
+persists after the pod exits. Fetch them at any time with:
+```bash
+./demos/text-classifier-demo.sh --fetch-results
+```
+
+See [`docs/DEMO.md`](DEMO.md) for image build instructions and full details.
 
 ---
 
@@ -219,6 +228,16 @@ Pods created in that namespace will be intercepted by Bridge and scheduled via S
 ---
 
 ## Troubleshooting
+
+**"Invalid partition name specified" — jobs fail immediately:**
+The Bridge Helm chart defaults `schedulerConfig.partition` to the Helm release name
+(`slurm-bridge`), which doesn't match any real Slurm partition. The fix is in
+`configs/slurm-bridge-values.yaml`:
+```yaml
+schedulerConfig:
+  partition: all    # must match an actual Slurm partition name
+```
+Symptoms: Bridge scheduler logs show `"could not create external job" err="[Unprocessable Entity, Invalid partition name specified]"` and slurmrestd logs show `error: invalid partition specified: slurm-bridge`. Apply the fix and `helm upgrade`.
 
 **Bridge pods not starting:**
 ```bash
@@ -252,3 +271,4 @@ If the Bridge scheduler pod is crashing with permission errors, reapply the patc
 ```bash
 ./scripts/deploy-bridge.sh  # re-running is idempotent
 ```
+

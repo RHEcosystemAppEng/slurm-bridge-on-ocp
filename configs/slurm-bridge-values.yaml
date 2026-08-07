@@ -2,3 +2,10 @@ admission:
   managedNamespaceSelector:
     matchLabels:
       managed-by-slurm: "true"
+
+# The chart defaults schedulerConfig.partition to the Helm release name
+# ("slurm-bridge"), which doesn't match our actual Slurm partition. Without
+# this override, every job submission fails with "Invalid partition name
+# specified" in slurmrestd because no partition named "slurm-bridge" exists.
+schedulerConfig:
+  partition: all

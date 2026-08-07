@@ -128,6 +128,10 @@ oc rollout status deployment/slurm-bridge-scheduler    -n "$NAMESPACE" --timeout
 
 # ---------------------------------------------------------------------------
 # Step 4: RBAC patch for the Bridge scheduler (OCP bug workaround — fix expected in v1.1.1+)
+#
+# NOTE: Helm upgrades reset the ClusterRole to chart defaults, so this patch
+# must be reapplied after every `helm upgrade slurm-bridge`. Running
+# deploy-bridge.sh is idempotent and handles this automatically.
 # ---------------------------------------------------------------------------
 section "Applying Bridge scheduler RBAC patch"
 log "Patching slurm-bridge-scheduler ClusterRole (OCP workaround)..."

@@ -78,21 +78,13 @@ if oc get crd controllers.slinky.slurm.net &>/dev/null; then
   log "CRDs already exist — skipping CRD install"
 else
   log "Installing CRDs via Helm..."
-  local_err=""
-  if ! local_err=$(helm upgrade --install slurm-operator-crds \
-      oci://ghcr.io/slinkyproject/charts/slurm-operator-crds \
-      --namespace "$OPERATOR_NS" \
-      --create-namespace \
-      --server-side=false 2>&1); then
-    warn "--server-side=false failed: $local_err — retrying without flag"
-    helm upgrade --install slurm-operator-crds \
-      oci://ghcr.io/slinkyproject/charts/slurm-operator-crds \
-      --namespace "$OPERATOR_NS" \
-      --create-namespace || {
-        error "Failed to install Slurm Operator CRDs"
-        exit 1
-      }
-  fi
+  helm upgrade --install slurm-operator-crds \
+    oci://ghcr.io/slinkyproject/charts/slurm-operator-crds \
+    --namespace "$OPERATOR_NS" \
+    --create-namespace || {
+      error "Failed to install Slurm Operator CRDs"
+      exit 1
+    }
 
   log "Waiting for CRDs to register..."
   sleep 5
@@ -113,23 +105,14 @@ if [ "$OPERATOR_RUNNING" = true ]; then
   warn "Operator already running — skipping operator install"
 else
   log "Installing Slurm Operator via Helm..."
-  local_err=""
-  if ! local_err=$(helm upgrade --install slurm-operator \
-      oci://ghcr.io/slinkyproject/charts/slurm-operator \
-      --namespace "$OPERATOR_NS" \
-      --create-namespace \
-      --server-side=false \
-      --wait --timeout 5m 2>&1); then
-    warn "--server-side=false failed: $local_err — retrying without flag"
-    helm upgrade --install slurm-operator \
-      oci://ghcr.io/slinkyproject/charts/slurm-operator \
-      --namespace "$OPERATOR_NS" \
-      --create-namespace \
-      --wait --timeout 5m || {
-        error "Failed to install Slurm Operator"
-        exit 1
-      }
-  fi
+  helm upgrade --install slurm-operator \
+    oci://ghcr.io/slinkyproject/charts/slurm-operator \
+    --namespace "$OPERATOR_NS" \
+    --create-namespace \
+    --wait --timeout 5m || {
+      error "Failed to install Slurm Operator"
+      exit 1
+    }
 
   log "Waiting for operator pod to be ready..."
   oc wait --for=condition=ready pod \

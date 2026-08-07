@@ -46,11 +46,16 @@ The main workload is a DistilBERT fine-tuning job on AG News, submitted as a pla
 # Build the training image (see docs/DEMO.md for in-cluster or external options)
 ./demos/text-classifier-demo.sh --image <your-training-image>
 
+# Full dataset, detached (submit and exit — training runs in background)
+./demos/text-classifier-demo.sh --image <your-training-image> --dataset full --detach
+
 # With GPU(s) — requires NVIDIA GPU Operator on the cluster
 ./demos/text-classifier-demo.sh --image <your-training-image> --gpu 1
 ```
 
-Baseline accuracy starts at chance level (~25%, 4 classes) and reaches ~90% after training. The training image auto-detects CUDA and falls back to CPU when no GPUs are available. See [`docs/DEMO.md`](docs/DEMO.md) for the full walkthrough, build instructions, and known gotchas.
+Baseline accuracy starts at chance level (~25%, 4 classes) and reaches ~90% after training. The training image auto-detects CUDA and falls back to CPU when no GPUs are available.
+
+**Attached vs. detached:** in attached mode (default), the script tails logs and automatically retrieves results. In detached mode (`--detach`), results are written to a PVC that persists after the pod exits — fetch them any time with `./demos/text-classifier-demo.sh --fetch-results`. See [`docs/DEMO.md`](docs/DEMO.md) for the full walkthrough and known gotchas.
 
 ## Repository Structure
 
@@ -115,7 +120,7 @@ This is left as future work. The current deployment uses a fixed pool of labeled
 
 ### Large-Scale / Distributed Training
 
-Training has been validated end-to-end with a small dataset (8k train / 2k test, CPU only). The full AG News dataset (120k rows) and GPU-accelerated multi-node runs have not yet been tested. The Bridge routing and DDP setup should be identical — the job spec is the same, only the dataset path and resource requests change — but this has not been confirmed on a GPU cluster.
+Training has been validated end-to-end with the full AG News dataset (120k train / 7.6k test, CPU, 2 DDP processes) via `--dataset full`. GPU-accelerated multi-node runs have not yet been tested. The Bridge routing and DDP setup should be identical — the job spec is the same, only the resource requests change — but this has not been confirmed on a GPU cluster.
 
 ### Namespace Isolation Requirement
 

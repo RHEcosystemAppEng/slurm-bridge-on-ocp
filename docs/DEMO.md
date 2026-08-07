@@ -55,16 +55,21 @@ oc start-build text-classifier-trainer --from-dir=training/ --follow
 oc policy add-role-to-group system:image-puller \
   system:serviceaccounts:text-classifier-demo -n text-classifier-build
 
-# 2. Run the demo (CPU)
+# 2. Run the demo (CPU, attached — tails logs, retrieves results)
 ./demos/text-classifier-demo.sh \
   --image image-registry.openshift-image-registry.svc:5000/text-classifier-build/text-classifier-trainer:latest
 
-# 2b. Or with GPU(s) — nproc_per_node auto-matches GPU count
+# 2b. Run with full dataset, detached (submits job and exits immediately)
+./demos/text-classifier-demo.sh \
+  --image image-registry.openshift-image-registry.svc:5000/text-classifier-build/text-classifier-trainer:latest \
+  --dataset full --detach
+
+# 2c. Or with GPU(s) — nproc_per_node auto-matches GPU count
 ./demos/text-classifier-demo.sh \
   --image image-registry.openshift-image-registry.svc:5000/text-classifier-build/text-classifier-trainer:latest \
   --gpu 1
 
-# 2c. 20 Newsgroups (20 topic categories, ~18k posts)
+# 2d. 20 Newsgroups (20 topic categories, ~18k posts)
 ./demos/text-classifier-demo.sh \
   --image image-registry.openshift-image-registry.svc:5000/text-classifier-build/text-classifier-trainer:latest \
   --dataset news20
@@ -78,14 +83,24 @@ oc policy add-role-to-group system:image-puller \
 ./demos/text-classifier-demo.sh --cleanup
 ```
 
-The script labels a namespace, submits the training Job, tails logs while it
-runs, and pulls the final `metrics.json` (baseline vs. per-epoch vs. final
-accuracy) plus the fine-tuned checkpoint into `results/text-classifier-demo/`.
+**Attached mode** (default): the script labels a namespace, submits the
+training Job, tails logs while it runs, and automatically pulls the final
+`metrics.json` plus the fine-tuned checkpoint into
+`results/text-classifier-demo/`.
+
+**Detached mode** (`--detach`): the script submits the Job and exits
+immediately. Results are written to a PersistentVolumeClaim (`training-results`)
+that survives after the pod exits — no grace period, no race condition. Fetch
+them whenever you're ready:
+
+```bash
+./demos/text-classifier-demo.sh --fetch-results
+```
 
 ## Monitoring a running job
 
-The demo script tails logs automatically, but if you want to monitor from
-a separate terminal:
+The demo script tails logs automatically in attached mode. For detached runs
+or monitoring from a separate terminal:
 
 ```bash
 # Pod status
@@ -105,10 +120,29 @@ oc exec -n slurm $CTRL -c slurmctld -- squeue
 oc describe pod -n text-classifier-demo -l job-name=text-classifier-training | tail -15
 ```
 
+## Retrieving results
+
+Results are stored on a PVC (`training-results`) that persists independently
+of the training pod. Fetch them at any time — hours or days after training
+completes — with:
+
+```bash
+./demos/text-classifier-demo.sh --fetch-results
+```
+
+This spins up a helper pod (UBI 9 with proper securityContext for OpenShift's
+restricted PodSecurity), mounts the PVC read-only, streams each file via
+`gzip` through `oc exec` (to avoid the ~60s exec timeout that kills plain
+`oc cp` on the 267MB model file), then cleans up the helper pod.
+
+The full-dataset checkpoint is ~257MB. Transfer takes about 50 seconds over
+the cluster API. No timing constraints — the PVC persists indefinitely.
+
 ## Live-tested results
 
-Run end-to-end on a real OpenShift cluster (3 epochs, 8,000 train / 2,000 test
-rows, 2 DDP processes on CPU):
+### Subset (8k train / 2k test — default dataset)
+
+Run end-to-end on a real OpenShift cluster (3 epochs, 2 DDP processes on CPU):
 
 ```
 baseline (pre-training) accuracy = 23.45%   (chance level for 4 classes: 25%)
@@ -117,29 +151,67 @@ epoch 2/3  train_loss=0.1956  eval_accuracy=90.80%
 epoch 3/3  train_loss=0.1132  eval_accuracy=90.85%
 ```
 
-Confirmed via `squeue` on `slurmctld` that the job was actually scheduled
-and run by Slurm, not just by Kubernetes' default scheduler — i.e. Bridge
-really did do its job. Total wall-clock time was **~36 minutes** on CPU with
-the current defaults (`OMP_NUM_THREADS=2`, 4-CPU limit, 2 DDP processes);
-see the "known gotchas" below for what that number is sensitive to.
+Wall-clock: **~36 minutes** on CPU (`OMP_NUM_THREADS=2`, 4-CPU limit, 2 DDP).
+
+### Full dataset (120k train / 7.6k test — `--dataset full`)
+
+Run end-to-end on the same cluster (3 epochs, 2 DDP processes on CPU):
+
+```
+baseline (pre-training) accuracy = 23.50%
+epoch 1/3  train_loss=0.2153  eval_accuracy=94.34%
+epoch 2/3  train_loss=0.1331  eval_accuracy=94.11%
+epoch 3/3  train_loss=0.0941  eval_accuracy=93.64%
+```
+
+Wall-clock: **~7 hours 53 minutes** on CPU (same resource config). The higher
+accuracy (94.3% vs 90.9%) comes from 15x more training data. Note slight
+overfitting in later epochs — accuracy peaks at epoch 1 then gradually drops,
+suggesting 1-2 epochs is optimal for this dataset size.
+
+Both confirmed via `squeue` on `slurmctld` that Slurm (not the K8s default
+scheduler) scheduled and ran the jobs.
 
 ## Known gotchas (found via live testing, not just code review)
 
+- **Bridge `schedulerConfig.partition` defaults to the Helm release name
+  ("slurm-bridge"), not to any real Slurm partition.** If you don't override
+  it in `configs/slurm-bridge-values.yaml`, every job immediately fails with
+  `"Invalid partition name specified"` in the Bridge scheduler logs and
+  `"invalid partition specified: slurm-bridge"` in slurmrestd. The fix is:
+  ```yaml
+  schedulerConfig:
+    partition: all    # must match a real Slurm partition
+  ```
+  This was the most confusing failure mode encountered — the pod just sits in
+  Pending with a cryptic event from `slurm-bridge-scheduler` and no obvious
+  pointer to "check your partition name".
 - **Bridge intercepts *every* pod in a `managed-by-slurm=true` namespace**,
   not just the ones you intend to route through Slurm — see the build-image
   warning above. Keep build/infra namespaces separate from workload
   namespaces.
 - **`oc cp`/`oc exec` cannot retrieve anything from a pod once its container
-  has exited** ("cannot exec into a container in a completed pod") — there is
-  no grace period on the Kubernetes side, it fails immediately once the
-  container transitions out of Running. `demos/text-classifier-demo.sh`
-  works around this by wrapping the training command with a trailing
-  `sleep`, and by detecting completion via `oc exec ... test -f
-  /results/metrics.json` (while the pod is still Running) instead of waiting
-  for the Job's `.status.succeeded` field (which only flips *after* that
-  sleep ends, by which point the pod is unreachable). If you're adapting this
-  pattern elsewhere, don't assume you can grab results after a Job shows
-  `Complete`.
+  has exited** ("cannot exec into a container in a completed pod") — it fails
+  immediately once the container transitions out of Running.
+  `demos/text-classifier-demo.sh` avoids this entirely by writing results to
+  a PVC (`training-results`) that persists after the pod exits. The
+  `--fetch-results` command spins up a helper pod to read from the PVC at
+  any time. If you're adapting this pattern elsewhere, don't assume you can
+  grab results after a Job shows `Complete` — use a PVC or push results
+  to external storage from within the training command.
+- **`oc cp` fails with "unexpected EOF" on large files (~60s timeout).**
+  The API server's exec streaming connection drops after roughly 60 seconds,
+  which isn't enough time to transfer the 267MB model checkpoint via `oc cp`
+  (which uses tar over exec internally). The demo script works around this by
+  streaming each file through `gzip -c` piped through `oc exec`, which
+  compresses on the fly and completes within the timeout window. If you hit
+  this on other clusters, the same pattern works: `oc exec <pod> -- gzip -c
+  /path/to/large-file > local-file.gz && gunzip local-file.gz`.
+- **Helper pods need OpenShift-compliant securityContext.** The `--fetch-results`
+  helper pod must include `runAsNonRoot`, `seccompProfile`, `allowPrivilegeEscalation:
+  false`, and `capabilities.drop: ["ALL"]` — without these, the pod stays
+  Pending indefinitely with PodSecurity warnings. The script handles this
+  automatically.
 - **CPU memory sizing**: two DDP processes each hold a full DistilBERT +
   AdamW optimizer (~1GB+ each) plus backward-pass activation memory. 3Gi
   request / 6Gi limit OOMKilled (exit 137) partway through epoch 1 in
