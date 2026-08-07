@@ -250,6 +250,99 @@ scheduler) scheduled and ran the jobs.
   masked a real failure during testing and left pods stuck in confusing
   SCC-forbidden errors with no obvious cause. It now fails loudly instead.
 
+### Running the examples end-to-end (copy-paste ready)
+
+These assume you've already deployed the stack (`./scripts/deploy.sh`) and
+the cluster is healthy (`oc get pods -n slurm` shows all Running).
+
+**Step 1 — Build the training image (one-time setup):**
+
+```bash
+# Create a build namespace (separate from Bridge-managed namespaces)
+oc new-project text-classifier-build
+
+# Create a BuildConfig that accepts uploaded source
+oc new-build --name=text-classifier-trainer --binary --strategy=docker
+
+# Upload training/ directory and build the image (~4 min)
+oc start-build text-classifier-trainer --from-dir=training/ --follow
+
+# Grant the demo namespace permission to pull this image
+oc policy add-role-to-group system:image-puller \
+  system:serviceaccounts:text-classifier-demo -n text-classifier-build
+```
+
+**Step 2a — Quick demo (AG News subset, ~36 min, attached):**
+
+```bash
+./demos/text-classifier-demo.sh \
+  --image image-registry.openshift-image-registry.svc:5000/text-classifier-build/text-classifier-trainer:latest
+```
+
+This creates the namespace, labels it for Bridge, submits the Job, tails
+logs until training finishes, then copies results to
+`results/text-classifier-demo/`.
+
+**Step 2b — Full dataset, detached (120k rows, ~8 hours on CPU):**
+
+```bash
+./demos/text-classifier-demo.sh \
+  --image image-registry.openshift-image-registry.svc:5000/text-classifier-build/text-classifier-trainer:latest \
+  --dataset full --detach
+```
+
+Submits and exits. Results persist on a PVC. Come back any time and run:
+
+```bash
+./demos/text-classifier-demo.sh --fetch-results
+```
+
+**Step 2c — GPU training (if cluster has GPUs):**
+
+```bash
+./demos/text-classifier-demo.sh \
+  --image image-registry.openshift-image-registry.svc:5000/text-classifier-build/text-classifier-trainer:latest \
+  --gpu 1
+```
+
+**Step 2d — 20 Newsgroups (20 classes, harder task):**
+
+```bash
+./demos/text-classifier-demo.sh \
+  --image image-registry.openshift-image-registry.svc:5000/text-classifier-build/text-classifier-trainer:latest \
+  --dataset news20
+```
+
+**Step 2e — Custom epochs or both flags combined:**
+
+```bash
+./demos/text-classifier-demo.sh \
+  --image image-registry.openshift-image-registry.svc:5000/text-classifier-build/text-classifier-trainer:latest \
+  --dataset full --epochs 1 --detach
+```
+
+**Step 3 — Verify Slurm is actually scheduling (while job is running):**
+
+```bash
+# Confirm Bridge routed the job through Slurm (not K8s default scheduler)
+CTRL=$(oc get pods -n slurm -l app.kubernetes.io/name=slurmctld -o jsonpath='{.items[0].metadata.name}')
+oc exec -n slurm $CTRL -c slurmctld -- squeue
+
+# Watch pod status
+oc get pods -n text-classifier-demo -w
+
+# Tail training logs
+oc logs -n text-classifier-demo -l job-name=text-classifier-training -f
+```
+
+**Step 4 — Clean up when done:**
+
+```bash
+./demos/text-classifier-demo.sh --cleanup
+```
+
+---
+
 ### Trying the fine-tuned model on real headlines
 
 `metrics.json` gives you accuracy numbers; `training/predict.py` gives you
@@ -263,20 +356,10 @@ python3 training/predict.py --checkpoint-dir results/text-classifier-demo/checkp
 
 # or, live:
 python3 training/predict.py --checkpoint-dir results/text-classifier-demo/checkpoint --interactive
+
+# sample random test rows
+python3 training/predict.py --checkpoint-dir results/text-classifier-demo/checkpoint --num-samples 10
 ```
-
-It can also run inside the cluster with no extra install, since the training
-image already has the checkpoint's dependencies baked in — but only *while
-the training pod's container is still alive* (its trailing grace-period
-`sleep`, by default ~180s after training finishes; `oc exec` stops working
-entirely the moment it exits):
-
-```bash
-oc exec -n text-classifier-demo <pod> -- python3 /app/predict.py --checkpoint-dir /results/checkpoint --num-samples 5
-```
-
-For anything after that window, use the local copy pulled into
-`results/text-classifier-demo/checkpoint/` instead.
 
 ## Design choices
 

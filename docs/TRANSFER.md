@@ -48,16 +48,56 @@ Currently validated: single-node, multi-process DDP (2 processes sharing one pod
 
 ### 3. Autoscaling Integration
 
-**Priority: Medium-Low (exploratory)**
+**Priority: Medium-High**
 
-Bridge uses a fixed pool of labeled worker nodes. This conflicts with Kubernetes-native autoscalers that operate without Slurm queue awareness.
+The current deployment uses a **fixed pool** of labeled worker nodes — you label 3 (or N) nodes at deploy time and that's the compute Bridge can use. This means:
 
-**Possible approaches:**
-- KEDA with a Slurm REST API scaler (reads `squeue` job count, scales node group)
-- Custom controller bridging Slurm queue depth to a K8s HPA/ScaledObject metric
-- Slurm's own `ResumeProgram`/`SuspendProgram` hooks to provision/deprovision OCP nodes
+- Jobs queue if all labeled nodes are busy, even if the cluster has idle capacity elsewhere
+- Idle labeled nodes waste resources when no Slurm jobs are running
+- No way to burst for large training runs and scale back down afterward
 
-All require significant engineering. Left as future work.
+This is the single biggest gap between "POC" and "production-ready."
+
+**Why it's hard:** Slurm and Kubernetes have fundamentally different scaling models. Slurm manages a static node inventory and decides what runs where. Kubernetes autoscalers (Cluster Autoscaler, KEDA, MachineSet scaling) add/remove nodes based on pod-level demand. Bridge sits in the middle — it intercepts K8s pods but submits them as Slurm jobs, so neither system has full visibility into the other's state.
+
+**Approach A: KEDA + Slurm REST API scaler**
+
+Write a custom KEDA scaler that queries `slurmrestd` (`GET /slurm/v0.0.44/jobs/` with state filter for pending jobs). When pending job count exceeds a threshold, KEDA scales a MachineSet (or a node group in the cloud provider) to add OCP worker nodes. A post-scale hook labels the new nodes as Bridge external nodes. On scale-down, unlabel and drain.
+
+- Pros: Clean separation; KEDA is well-supported on OCP
+- Cons: Latency (new nodes take minutes to provision); label lifecycle management; race conditions between Slurm queue and KEDA cooldown
+
+**Approach B: Slurm elastic compute (`ResumeProgram` / `SuspendProgram`)**
+
+Slurm natively supports elastic scaling through configurable programs called when nodes transition between idle→powered-down and powered-down→resuming. These could be wired to OpenShift MachineSet scaling or cloud provider APIs:
+
+```
+ResumeProgram = /usr/local/bin/ocp-resume-node.sh   # scales MachineSet up + labels node
+SuspendProgram = /usr/local/bin/ocp-suspend-node.sh # unlabels + scales MachineSet down
+SuspendTime = 300  # idle for 5min → power down
+```
+
+- Pros: Slurm-native; scheduling decisions stay with Slurm (which has queue depth awareness); proven pattern in traditional HPC clouds
+- Cons: Scripts run inside slurmctld pod (security implications); need RBAC to modify MachineSets from inside the cluster; mismatch between Slurm's node-centric model and OCP's machine-centric model
+
+**Approach C: Custom Kubernetes controller**
+
+A dedicated controller that watches both the Slurm REST API (pending jobs, idle nodes) and OCP MachineSets/MachineAutoscalers. It bridges the gap by:
+
+1. Polling Slurm queue depth every N seconds
+2. If pending jobs > threshold for > M seconds, scaling up MachineSets
+3. Labeling new Ready nodes as Bridge external nodes
+4. On scale-down: draining Slurm jobs from a node (`scontrol update NodeName=X State=DRAIN`), waiting for completion, then unlabeling and deleting the Machine
+
+- Pros: Most control; can encode complex policies (e.g., "never scale below 3 nodes", "max burst to 10 for GPU jobs")
+- Cons: Most engineering effort; custom CRD + reconciliation loop; failure modes need careful handling
+
+**Recommended starting point:** Approach A (KEDA) for a quick win on CPU workloads, with Approach B as a longer-term target for tighter Slurm integration. Approach C is the "full production" answer but requires the most investment.
+
+**Open questions:**
+- How long does it take for a new OCP worker node to become schedulable by Bridge after MachineSet scale-up? (Includes: machine provisioning, node bootstrap, kubelet ready, Bridge controller detecting the label and adding it to Slurm's node inventory)
+- Can Bridge handle nodes appearing/disappearing dynamically, or does it require a restart?
+- What's the minimum idle time before scale-down is safe (must account for Slurm job draining)?
 
 ### 4. Integration with OpenShift AI / Kubeflow
 
@@ -65,11 +105,34 @@ All require significant engineering. Left as future work.
 
 The whole point of Bridge is transparent integration. A natural next step is submitting training jobs from OpenShift AI (RHOAI) notebooks or Kubeflow Pipelines and confirming they route through Slurm without modification.
 
-### 5. 20 Newsgroups Dataset Testing
+### 5. More Practical / Production-Relevant Workloads
 
-**Priority: Low**
+**Priority: Medium**
 
-The `--dataset news20` path exists (11k train, 7k test, 20 classes) but hasn't been live-tested. Good for validating the model on a harder classification task.
+The current demo (AG News text classification with DistilBERT) is deliberately small and fast for validation purposes. To make the POC more compelling for production conversations, consider replacing or supplementing it with workloads that better represent real enterprise use cases:
+
+**Larger language models:**
+- Fine-tune a **Llama 2 7B** or **Mistral 7B** LoRA adapter on a domain-specific dataset (e.g., customer support tickets, internal documentation). This exercises GPU memory management, gradient checkpointing, and actual multi-hour training times that benefit from Slurm's job scheduling.
+- Fine-tune **CodeLlama** on internal code repositories — directly relevant to developer tooling teams.
+
+**Computer vision:**
+- Train a **YOLOv8** or **ResNet** model on a defect detection dataset (manufacturing QC). This is a common Red Hat customer use case and exercises different resource profiles (high GPU utilization, large image batches).
+- Medical imaging classification (e.g., chest X-ray) — demonstrates compliance-sensitive workloads where Slurm's accounting and resource isolation add value.
+
+**Tabular / structured data:**
+- Train an **XGBoost** or **LightGBM** ensemble on a fraud detection dataset. Demonstrates that Bridge isn't limited to deep learning — any batch workload benefits from Slurm scheduling.
+- Time-series forecasting (demand planning, anomaly detection) with PyTorch Forecasting.
+
+**Multi-job pipelines:**
+- A realistic ML pipeline: data preprocessing Job → training Job → evaluation Job → model registration. Submit all through Bridge and demonstrate Slurm managing the dependency chain (or use Kubeflow Pipelines with Bridge-managed execution).
+
+**Why this matters more than 20 Newsgroups:** The 20 Newsgroups dataset (`--dataset news20`) tests a harder classification task (20 classes vs 4) but doesn't fundamentally change the story. It's still a small text classification problem on a small model. The value of Slurm scheduling becomes most obvious when:
+- Training takes hours/days (queue management matters)
+- Multiple users compete for GPUs (fair-share scheduling matters)
+- Jobs have heterogeneous resource requirements (Slurm's partition/QOS/priority system matters)
+- Compliance requires job accounting and audit trails
+
+A single LoRA fine-tuning run on a 7B model with real data would demonstrate all of these better than any number of DistilBERT experiments.
 
 ---
 
