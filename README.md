@@ -40,6 +40,8 @@ oc logs bridge-test -n default
 
 ## PyTorch Demo
 
+[Video demo](https://youtu.be/ZNRRafT9_ns) | [Full walkthrough](docs/DEMO.md)
+
 The main workload is a DistilBERT fine-tuning job on AG News, submitted as a plain Kubernetes Job routed through Bridge:
 
 ```bash

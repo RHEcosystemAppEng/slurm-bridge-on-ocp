@@ -1,5 +1,7 @@
 # Demo — Text Classifier Fine-Tuning via Slurm Bridge
 
+**Video walkthrough:** [Watch the demo on YouTube](https://youtu.be/ZNRRafT9_ns)
+
 ## Use case
 
 Fine-tune a pretrained Hugging Face model (`distilbert-base-uncased`) into a
@@ -37,106 +39,108 @@ submission path.**
 
 ## Running it
 
+These assume you've already deployed the stack (`./scripts/deploy.sh`) and
+the cluster is healthy (`oc get pods -n slurm` shows all Running).
+
+### Step 1 — Build the training image (one-time setup)
+
 ```bash
-# 1. Build the training image — in-cluster (no external registry needed):
-#
-#    IMPORTANT: put the build in its OWN namespace, NOT one labeled
-#    managed-by-slurm=true. Bridge's admission controller intercepts every
-#    pod created in such a namespace, including OpenShift's own build pods —
-#    it will repeatedly (and silently, from the pod's perspective — check
-#    the Bridge scheduler's logs to see it) try and fail to schedule the
-#    build pod via Slurm, since build pods need a privileged/hostPath
-#    security context Slurm has no way to satisfy. The pod just sits in
-#    Pending forever with no scheduling events at all, which is a confusing
-#    thing to debug blind — confirmed by hitting it in live testing.
+# Create a build namespace (separate from Bridge-managed namespaces — see gotchas below)
 oc new-project text-classifier-build
+
+# Create a BuildConfig that accepts uploaded source
 oc new-build --name=text-classifier-trainer --binary --strategy=docker
+
+# Upload training/ directory and build the image (~4 min)
 oc start-build text-classifier-trainer --from-dir=training/ --follow
+
+# Grant the demo namespace permission to pull this image
 oc policy add-role-to-group system:image-puller \
   system:serviceaccounts:text-classifier-demo -n text-classifier-build
+```
 
-# 2. Run the demo (CPU, attached — tails logs, retrieves results)
+Alternative: build and push externally instead:
+```bash
+podman build -t <registry>/<repo>/slurm-bridge-text-classifier:latest -f training/Dockerfile training/
+podman push <registry>/<repo>/slurm-bridge-text-classifier:latest
+# For CPU-only: use -f training/Dockerfile.cpu instead
+```
+
+### Step 2 — Run training
+
+```bash
+# Quick demo (AG News subset, ~36 min, attached — tails logs, retrieves results)
 ./demos/text-classifier-demo.sh \
   --image image-registry.openshift-image-registry.svc:5000/text-classifier-build/text-classifier-trainer:latest
 
-# 2b. Run with full dataset, detached (submits job and exits immediately)
+# Full dataset, detached (120k rows, ~8 hours on CPU — results persist on PVC)
 ./demos/text-classifier-demo.sh \
   --image image-registry.openshift-image-registry.svc:5000/text-classifier-build/text-classifier-trainer:latest \
   --dataset full --detach
 
-# 2c. Or with GPU(s) — nproc_per_node auto-matches GPU count
+# GPU training (requires NVIDIA GPU Operator on cluster)
 ./demos/text-classifier-demo.sh \
   --image image-registry.openshift-image-registry.svc:5000/text-classifier-build/text-classifier-trainer:latest \
   --gpu 1
 
-# 2d. 20 Newsgroups (20 topic categories, ~18k posts)
+# 20 Newsgroups (20 classes, harder task)
 ./demos/text-classifier-demo.sh \
   --image image-registry.openshift-image-registry.svc:5000/text-classifier-build/text-classifier-trainer:latest \
   --dataset news20
 
-# (Alternative to step 1: build/push externally instead —
-#  podman build -t <registry>/<repo>/slurm-bridge-text-classifier:latest -f training/Dockerfile training/
-#  podman push <registry>/<repo>/slurm-bridge-text-classifier:latest
-#  For CPU-only: use -f training/Dockerfile.cpu instead)
-
-# 3. Clean up
-./demos/text-classifier-demo.sh --cleanup
+# Custom epochs or combined flags
+./demos/text-classifier-demo.sh \
+  --image image-registry.openshift-image-registry.svc:5000/text-classifier-build/text-classifier-trainer:latest \
+  --dataset full --epochs 1 --detach
 ```
 
-**Attached mode** (default): the script labels a namespace, submits the
-training Job, tails logs while it runs, and automatically pulls the final
-`metrics.json` plus the fine-tuned checkpoint into
-`results/text-classifier-demo/`.
+**Attached mode** (default): tails logs until training finishes, then
+automatically copies results to `results/text-classifier-demo/`.
 
-**Detached mode** (`--detach`): the script submits the Job and exits
-immediately. Results are written to a PersistentVolumeClaim (`training-results`)
-that survives after the pod exits — no grace period, no race condition. Fetch
-them whenever you're ready:
-
+**Detached mode** (`--detach`): submits and exits. Results are written to a
+PVC that persists after the pod dies. Fetch them any time with:
 ```bash
 ./demos/text-classifier-demo.sh --fetch-results
 ```
 
-## Monitoring a running job
-
-The demo script tails logs automatically in attached mode. For detached runs
-or monitoring from a separate terminal:
+### Step 3 — Monitor and verify (while job is running)
 
 ```bash
-# Pod status
-oc get pods -n text-classifier-demo -o wide
-
-# Live log stream
-oc logs -n text-classifier-demo -l job-name=text-classifier-training -f
-
-# Last few lines (non-blocking)
-oc logs -n text-classifier-demo -l job-name=text-classifier-training --tail=20
-
-# Check if Slurm is tracking it
+# Confirm Bridge routed the job through Slurm (not K8s default scheduler)
 CTRL=$(oc get pods -n slurm -l app.kubernetes.io/name=slurmctld -o jsonpath='{.items[0].metadata.name}')
 oc exec -n slurm $CTRL -c slurmctld -- squeue
+
+# Watch pod status
+oc get pods -n text-classifier-demo -w
+
+# Tail training logs
+oc logs -n text-classifier-demo -l job-name=text-classifier-training -f
 
 # Pod events (useful if stuck in Pending/ContainerCreating)
 oc describe pod -n text-classifier-demo -l job-name=text-classifier-training | tail -15
 ```
 
-## Retrieving results
-
-Results are stored on a PVC (`training-results`) that persists independently
-of the training pod. Fetch them at any time — hours or days after training
-completes — with:
+### Step 4 — Try the fine-tuned model
 
 ```bash
-./demos/text-classifier-demo.sh --fetch-results
+pip install torch transformers pandas  # if not already installed locally
+python3 training/predict.py --checkpoint-dir results/text-classifier-demo/checkpoint \
+  --text "Apple unveils new chip for the iPhone" "Lakers win in overtime thriller"
+
+# Interactive mode
+python3 training/predict.py --checkpoint-dir results/text-classifier-demo/checkpoint --interactive
+
+# Sample random test rows
+python3 training/predict.py --checkpoint-dir results/text-classifier-demo/checkpoint --num-samples 10
 ```
 
-This spins up a helper pod (UBI 9 with proper securityContext for OpenShift's
-restricted PodSecurity), mounts the PVC read-only, streams each file via
-`gzip` through `oc exec` (to avoid the ~60s exec timeout that kills plain
-`oc cp` on the 267MB model file), then cleans up the helper pod.
+### Step 5 — Clean up
 
-The full-dataset checkpoint is ~257MB. Transfer takes about 50 seconds over
-the cluster API. No timing constraints — the PVC persists indefinitely.
+```bash
+./demos/text-classifier-demo.sh --cleanup
+```
+
+---
 
 ## Live-tested results
 
@@ -172,6 +176,8 @@ suggesting 1-2 epochs is optimal for this dataset size.
 Both confirmed via `squeue` on `slurmctld` that Slurm (not the K8s default
 scheduler) scheduled and ran the jobs.
 
+---
+
 ## Known gotchas (found via live testing, not just code review)
 
 - **Bridge `schedulerConfig.partition` defaults to the Helm release name
@@ -187,45 +193,29 @@ scheduler) scheduled and ran the jobs.
   Pending with a cryptic event from `slurm-bridge-scheduler` and no obvious
   pointer to "check your partition name".
 - **Bridge intercepts *every* pod in a `managed-by-slurm=true` namespace**,
-  not just the ones you intend to route through Slurm — see the build-image
-  warning above. Keep build/infra namespaces separate from workload
-  namespaces.
-- **`oc cp`/`oc exec` cannot retrieve anything from a pod once its container
-  has exited** ("cannot exec into a container in a completed pod") — it fails
-  immediately once the container transitions out of Running.
-  `demos/text-classifier-demo.sh` avoids this entirely by writing results to
-  a PVC (`training-results`) that persists after the pod exits. The
-  `--fetch-results` command spins up a helper pod to read from the PVC at
-  any time. If you're adapting this pattern elsewhere, don't assume you can
-  grab results after a Job shows `Complete` — use a PVC or push results
-  to external storage from within the training command.
+  not just the ones you intend to route through Slurm. This includes
+  OpenShift's own build pods, which need privileged security contexts Slurm
+  can't satisfy — they sit in Pending forever with zero scheduling events.
+  Keep build/infra namespaces separate from workload namespaces.
+- **`oc cp`/`oc exec` cannot retrieve anything from a completed pod.** The
+  demo script avoids this by writing results to a PVC that persists after
+  the pod exits. The `--fetch-results` command spins up a helper pod to
+  read from the PVC at any time.
 - **`oc cp` fails with "unexpected EOF" on large files (~60s timeout).**
-  The API server's exec streaming connection drops after roughly 60 seconds,
-  which isn't enough time to transfer the 267MB model checkpoint via `oc cp`
-  (which uses tar over exec internally). The demo script works around this by
-  streaming each file through `gzip -c` piped through `oc exec`, which
-  compresses on the fly and completes within the timeout window. If you hit
-  this on other clusters, the same pattern works: `oc exec <pod> -- gzip -c
-  /path/to/large-file > local-file.gz && gunzip local-file.gz`.
-- **Helper pods need OpenShift-compliant securityContext.** The `--fetch-results`
-  helper pod must include `runAsNonRoot`, `seccompProfile`, `allowPrivilegeEscalation:
-  false`, and `capabilities.drop: ["ALL"]` — without these, the pod stays
-  Pending indefinitely with PodSecurity warnings. The script handles this
-  automatically.
-- **CPU memory sizing**: two DDP processes each hold a full DistilBERT +
-  AdamW optimizer (~1GB+ each) plus backward-pass activation memory. 3Gi
-  request / 6Gi limit OOMKilled (exit 137) partway through epoch 1 in
-  testing; 6Gi/12Gi has headroom.
-- **`torchrun` defaults `OMP_NUM_THREADS=1` per process** when
-  `nproc_per_node>1`, to avoid oversubscription — overly conservative given
-  the CPU limits here, and roughly doubled training time until set
-  explicitly (`OMP_NUM_THREADS=2` in the Job's env, given a 4-CPU limit and 2
-  processes).
+  The demo script works around this by streaming each file through `gzip -c`
+  piped through `oc exec`. If you hit this elsewhere: `oc exec <pod> --
+  gzip -c /path/to/large-file > local.gz && gunzip local.gz`.
+- **Helper pods need OpenShift-compliant securityContext** (`runAsNonRoot`,
+  `seccompProfile`, `allowPrivilegeEscalation: false`, `capabilities.drop:
+  ["ALL"]`) — without these, pods stay Pending with PodSecurity warnings.
+  The script handles this automatically.
+- **CPU memory sizing**: 3Gi/6Gi OOMKilled with 2 DDP processes; 6Gi/12Gi
+  has headroom.
+- **`torchrun` defaults `OMP_NUM_THREADS=1`** when `nproc_per_node>1` —
+  roughly doubles training time until set explicitly (`OMP_NUM_THREADS=2`
+  in the Job's env, given a 4-CPU limit and 2 processes).
 - **GPU pods stuck in Pending.** The deploy script labels only the first 3
-  generic worker nodes as Bridge external nodes — GPU nodes won't be among
-  them unless you label them explicitly. Without the label, Bridge has no
-  eligible node to place a pod requesting `nvidia.com/gpu`, and it stays
-  Pending with `Insufficient nvidia.com/gpu`. Fix:
+  generic worker nodes. GPU nodes need the label too:
   ```bash
   for node in $(oc get nodes -o jsonpath='{range .items[?(@.status.capacity.nvidia\.com/gpu)]}{.metadata.name}{"\n"}{end}'); do
     oc patch "node/$node" \
@@ -233,133 +223,14 @@ scheduler) scheduled and ran the jobs.
       --type=merge
   done
   ```
-- **Rebuild the image after switching Dockerfiles.** The default `Dockerfile`
-  is GPU-capable (PyTorch CUDA base); `Dockerfile.cpu` is the smaller
-  CPU-only variant. If you change which Dockerfile is used (or edit either
-  one), you need to trigger a new build — the existing image in the registry
-  still has the old layers:
+- **Rebuild the image after switching Dockerfiles.** `oc new-project` and
+  `oc new-build` only need to run once; re-running `oc start-build` is
+  enough to pick up changes:
   ```bash
   oc start-build text-classifier-trainer -n text-classifier-build --from-dir=training/ --follow
   ```
-  `oc new-project` and `oc new-build` only need to run once; re-running
-  `oc start-build` is enough to pick up Dockerfile/code changes.
-- **`oc adm policy add-scc-to-user` is idempotent, so it should never
-  legitimately fail** — if it does, that's a real problem (bad permissions,
-  a transient API error), not "already granted". An earlier version of
-  `deploy-slurm.sh` swallowed failures with that assumption, which once
-  masked a real failure during testing and left pods stuck in confusing
-  SCC-forbidden errors with no obvious cause. It now fails loudly instead.
-
-### Running the examples end-to-end (copy-paste ready)
-
-These assume you've already deployed the stack (`./scripts/deploy.sh`) and
-the cluster is healthy (`oc get pods -n slurm` shows all Running).
-
-**Step 1 — Build the training image (one-time setup):**
-
-```bash
-# Create a build namespace (separate from Bridge-managed namespaces)
-oc new-project text-classifier-build
-
-# Create a BuildConfig that accepts uploaded source
-oc new-build --name=text-classifier-trainer --binary --strategy=docker
-
-# Upload training/ directory and build the image (~4 min)
-oc start-build text-classifier-trainer --from-dir=training/ --follow
-
-# Grant the demo namespace permission to pull this image
-oc policy add-role-to-group system:image-puller \
-  system:serviceaccounts:text-classifier-demo -n text-classifier-build
-```
-
-**Step 2a — Quick demo (AG News subset, ~36 min, attached):**
-
-```bash
-./demos/text-classifier-demo.sh \
-  --image image-registry.openshift-image-registry.svc:5000/text-classifier-build/text-classifier-trainer:latest
-```
-
-This creates the namespace, labels it for Bridge, submits the Job, tails
-logs until training finishes, then copies results to
-`results/text-classifier-demo/`.
-
-**Step 2b — Full dataset, detached (120k rows, ~8 hours on CPU):**
-
-```bash
-./demos/text-classifier-demo.sh \
-  --image image-registry.openshift-image-registry.svc:5000/text-classifier-build/text-classifier-trainer:latest \
-  --dataset full --detach
-```
-
-Submits and exits. Results persist on a PVC. Come back any time and run:
-
-```bash
-./demos/text-classifier-demo.sh --fetch-results
-```
-
-**Step 2c — GPU training (if cluster has GPUs):**
-
-```bash
-./demos/text-classifier-demo.sh \
-  --image image-registry.openshift-image-registry.svc:5000/text-classifier-build/text-classifier-trainer:latest \
-  --gpu 1
-```
-
-**Step 2d — 20 Newsgroups (20 classes, harder task):**
-
-```bash
-./demos/text-classifier-demo.sh \
-  --image image-registry.openshift-image-registry.svc:5000/text-classifier-build/text-classifier-trainer:latest \
-  --dataset news20
-```
-
-**Step 2e — Custom epochs or both flags combined:**
-
-```bash
-./demos/text-classifier-demo.sh \
-  --image image-registry.openshift-image-registry.svc:5000/text-classifier-build/text-classifier-trainer:latest \
-  --dataset full --epochs 1 --detach
-```
-
-**Step 3 — Verify Slurm is actually scheduling (while job is running):**
-
-```bash
-# Confirm Bridge routed the job through Slurm (not K8s default scheduler)
-CTRL=$(oc get pods -n slurm -l app.kubernetes.io/name=slurmctld -o jsonpath='{.items[0].metadata.name}')
-oc exec -n slurm $CTRL -c slurmctld -- squeue
-
-# Watch pod status
-oc get pods -n text-classifier-demo -w
-
-# Tail training logs
-oc logs -n text-classifier-demo -l job-name=text-classifier-training -f
-```
-
-**Step 4 — Clean up when done:**
-
-```bash
-./demos/text-classifier-demo.sh --cleanup
-```
 
 ---
-
-### Trying the fine-tuned model on real headlines
-
-`metrics.json` gives you accuracy numbers; `training/predict.py` gives you
-the actual model in action — classify arbitrary text, sample from the test
-set, or classify headlines interactively:
-
-```bash
-pip install torch transformers pandas  # if not already installed locally
-python3 training/predict.py --checkpoint-dir results/text-classifier-demo/checkpoint \
-  --text "Apple unveils new chip for the iPhone" "Lakers win in overtime thriller"
-
-# or, live:
-python3 training/predict.py --checkpoint-dir results/text-classifier-demo/checkpoint --interactive
-
-# sample random test rows
-python3 training/predict.py --checkpoint-dir results/text-classifier-demo/checkpoint --num-samples 10
-```
 
 ## Design choices
 
